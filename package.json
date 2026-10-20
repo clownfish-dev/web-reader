@@ -1,0 +1,16 @@
+{
+  "name": "web-reader",
+  "version": "0.9.1",
+  "description": "Browsing MCP server for Claude Code: reads and operates pages in a dedicated Edge copy",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "tools": "node call.mjs list"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.17.0",
+    "playwright-core": "1.48.2"
+  },
+  "type": "module",
+  "private": true
+}
