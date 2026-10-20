@@ -31,6 +31,7 @@
 // hidden (devtools_extra / WEB_READER_DEVTOOLS_ALL=1 shows them); tool descriptions point
 // to the usually better tool; auto_scroll reports reached_limit.
 // 0.9.1: short tool and parameter descriptions in the tool list (tool-text.mjs).
+// 0.9.2: save_places checks Google sign-in before the save menu (not_logged_in).
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -45,7 +46,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { registerSearchTools } from './search.mjs';
 import { shortTool } from './tool-text.mjs';
 
-const VERSION = '0.9.1';
+const VERSION = '0.9.2';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROFILE = process.env.WEB_READER_PROFILE || path.join(HERE, 'profile');
 const CHANNELS = (process.env.WEB_READER_CHANNEL || 'msedge,chrome').split(',');
@@ -1448,6 +1449,18 @@ async function clickEl(h) {
 // ---- Google Maps: put many places into a list (open, save, verify) ----
 const MAPS_SAVE_BTN = /^(저장|저장됨|Save|Saved|保存|保存済み)$/;
 const clean = (s) => String(s || '').replace(/[-]/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
+// Signed in or not, from the Maps header: the Google Account button when signed in, a
+// sign-in link/button otherwise. The header can come after the place panel, so it is
+// waited for briefly; unknown (neither shown) counts as signed in and the save menu decides.
+async function mapsSignedOut(page) {
+  return page.waitForFunction(() => {
+    const acct = document.querySelector('a[href*="SignOutOptions"], a[aria-label*="Google 계정"], a[aria-label*="Google Account"], a[aria-label*="Google アカウント"]');
+    const signin = document.querySelector('a[href*="accounts.google.com/ServiceLogin"], a[href*="accounts.google.com/v3/signin"], a[href*="accounts.google.com/signin"]')
+      || [...document.querySelectorAll('a, button')].find((e) => /^(로그인|Sign in|ログイン)$/.test((e.getAttribute('aria-label') || e.innerText || '').trim()) && e.getClientRects().length);
+    return acct ? 'in' : signin ? 'out' : null;
+  }, null, { timeout: 6000 }).then((h) => h.jsonValue()).then((v) => v === 'out').catch(() => false);
+}
+
 // The place panel is the [role=main] whose label is the place name in its h1 (a result
 // list has other h1s, e.g. "스폰서" over an ad).
 async function mapsPanel(page) {
@@ -1462,8 +1475,8 @@ async function mapsPanel(page) {
       if (document.querySelector('a[href*="ServiceLogin"]') && !document.querySelector('[role=feed]')) return { error: 'not_logged_in' };
       return { error: 'not_a_single_place', candidates: [...document.querySelectorAll('[role=feed] a[href*="/maps/place/"]')].slice(0, 5).map((a) => a.getAttribute('aria-label')) };
     }
-    return { name: h.innerText.trim(), signed_out: !!document.querySelector('a[href*="ServiceLogin"]') };
-  });
+    return { name: h.innerText.trim() };
+  }).then(async (r) => (r.error ? r : { ...r, signed_out: await mapsSignedOut(page) }));
 }
 async function mapsSaveButton(page) {
   for (const h of await page.$$('[role=main] button')) {
@@ -1478,7 +1491,8 @@ async function mapsMenu(page) {
   if (!btn) return { error: 'save_button_not_found' };
   await clickEl(btn);
   const menu = await page.waitForSelector('[role=menu] [role=menuitemradio], [role=menu] [role=menuitemcheckbox]', { timeout: 10000 }).catch(() => null);
-  if (!menu) return { error: 'save_menu_not_opened' };
+  // Signed out, 저장 opens a sign-in prompt (or goes to the sign-in page) instead of the menu.
+  if (!menu) return { error: page.url().includes('accounts.google.com') || (await mapsSignedOut(page)) ? 'not_logged_in' : 'save_menu_not_opened' };
   await sleep(300);
   const items = [];
   for (const h of await page.$$('[role=menu] [role=menuitemradio], [role=menu] [role=menuitemcheckbox]')) {
