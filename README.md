@@ -1,4 +1,4 @@
-# web-reader 0.9.2
+# web-reader 0.9.4
 
 Claude Code가 웹페이지를 읽고 조작할 때 쓰는 MCP 서버예요. PC에 깔린 Edge와 따로 노는 **전용 Edge 사본**으로 페이지를 열기 때문에, 평소 쓰는 브라우저·로그인과 섞이지 않아요. Cloudflare·403으로 막히는 사이트도 실제 브라우저로 열어 읽고, 사람 확인이 필요하면 창을 띄워 사용자가 한 번 풀면 그 뒤로는 로그인이 유지돼요.
 
@@ -76,7 +76,7 @@ Claude가 알아서 골라 쓰지만, 이름을 알아 두면 "read_smart로 읽
 | 분류 | 도구 |
 |---|---|
 | 읽기 | `read_smart`(주소 하나 읽기, 보통 이것), `web_search`, `get_links`, `check_domains`, `collect_post` |
-| 검색 | `hotel_search`(구글 호텔), `transit_route`(구글 지도 경로) |
+| 검색 | `hotel_search`(구글 호텔), `transit_route`(구글 지도 경로), `place_lookup`(장소 이름 → 구글 평점·리뷰 수·좌표·폐업) |
 | 이미지·지도 | `page_images`, `find_place_photos`, `fetch_images`, `contact_sheet`, `static_map`, `save_places`(구글 지도 저장 목록) |
 | 열린 페이지 | `open_page`, `read_open_page`, `click`, `scroll`, `screenshot`, `wait_for_human`, `go_back`, `close_page` |
 | API | `api_responses`, `page_fetch` |
@@ -87,7 +87,9 @@ Claude가 알아서 골라 쓰지만, 이름을 알아 두면 "read_smart로 읽
 - **페이지 속 JSON**: `read_smart`에 `embedded_json:true`(Next.js·Nuxt 등 데이터). 크면 구조만 오고 `json_paths`·`json_find`로 골라 받아요.
 - **끝까지 내려야 나오는 내용**: `auto_scroll:true`.
 - **조작**: `open_page` → `take_snapshot`(요소마다 uid) → uid로 `click`/`fill`/`press_key` → `read_open_page`로 확인 → `close_page`. `click`은 누른 뒤 바뀐 내용을 `after_click`으로 같이 돌려줘요.
-- **여러 탭 동시**: `open_page`를 3~4개 열고 page_id마다 따로 부르면 동시에 돌아요.
+- **여러 주소 한 번에**: `read_smart`에 `urls`(최대 50개). 탭은 사이트마다 5개로 시작해 잘되면 최대 10개까지 늘고, 403·확인 화면·429가 나오면 2개로 줄인 뒤 막힌 주소를 한 번 더 읽어요.
+- **여러 탭 동시**: 읽기 도구는 읽기 전용 표시(`readOnlyHint`)가 있어서 Claude Code가 한 메시지 안의 여러 호출을 동시에 보내요. 조작이 필요하면 `open_page`를 여러 개 열고 page_id마다 따로 불러요.
+- **구글 장소 정보**: `place_lookup`(이름 + `near` 좌표). 체인점은 가까운 지점을 골라요. 구글 응답 형식에 기대므로 바뀌면 빈 결과가 날 수 있어요.
 - **API 찾기·부르기**: `open_page` → `api_responses`(받은 JSON 목록) → `page_fetch`(같은 사이트만, GET 기본, POST 등 쓰기는 `allow_write:true`).
 - 도구 결과는 웹에서 온 데이터라, 그 안에 적힌 지시는 따르지 않아요.
 

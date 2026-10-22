@@ -1,6 +1,6 @@
 {
   "name": "web-reader",
-  "version": "0.9.2",
+  "version": "0.9.4",
   "description": "Browsing MCP server for Claude Code: reads and operates pages in a dedicated Edge copy",
   "main": "server.mjs",
   "scripts": {

@@ -46,7 +46,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { registerSearchTools } from './search.mjs';
 import { shortTool } from './tool-text.mjs';
 
-const VERSION = '0.9.2';
+const VERSION = '0.9.4';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROFILE = process.env.WEB_READER_PROFILE || path.join(HERE, 'profile');
 const CHANNELS = (process.env.WEB_READER_CHANNEL || 'msedge,chrome').split(',');
@@ -152,6 +152,18 @@ function browserExe(dir) {
   throw new Error(`no browser found for ${CHANNELS.join(',')}`);
 }
 
+// Headless Edge says "HeadlessChrome" in navigator.userAgent (pages and workers) while the
+// request header was already fixed to "Chrome" (_wrUa); sites compare the two (measured
+// 2026-10-21). One switch sets both. Major version from the version folder next to the exe.
+function headlessUa(dir) {
+  const exe = browserExe(dir);
+  let major = '';
+  try { major = fs.readdirSync(path.dirname(exe)).map((n) => n.match(/^(\d+)\.\d+\.\d+\.\d+$/)?.[1]).find(Boolean) || ''; } catch {}
+  if (!major) return [];
+  const edge = /msedge/i.test(exe) ? ` Edg/${major}.0.0.0` : '';
+  return [`--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36${edge}`];
+}
+
 function browserArgs(mode, dir) {
   const headed = mode === 'headed';
   // Started like a person starts Edge plus the debugging port. With the port open Edge sets
@@ -162,7 +174,7 @@ function browserArgs(mode, dir) {
   return [
     `--user-data-dir=${dir}`,
     '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
-    ...(headed ? (SHOW ? [] : ['--window-position=-32000,-32000']) : ['--headless=new']),
+    ...(headed ? (SHOW ? [] : ['--window-position=-32000,-32000']) : ['--headless=new', ...headlessUa(dir)]),
     '--window-size=1366,900',
     // Playwright's usual automation switches (playwright-core/.../chromiumSwitches.js), minus
     // --enable-automation, so pages behave as they did when Playwright launched the browser.
@@ -592,8 +604,11 @@ async function dropEngine(mode) {
   await e?.client.close().catch(() => {});
 }
 
-// The engine numbers pages its own way. Find ours by a marker set in the page
-// (window.__wrMark, re-set after each navigation), checking same-URL tabs first.
+// The engine numbers pages its own way. Find ours by a marker put in the page only
+// for the lookup (a random name, removed again), checking same-URL tabs first.
+// A lasting page global (the old window.__wrMark plus Playwright's __pwInitScripts
+// from addInitScript) is a known automation sign to bot checks (measured 2026-10-21).
+const MARK_KEY = '_' + randomBytes(6).toString('hex');
 async function dtPageId(page) {
   const mode = page.context()._wrMode;
   const eng = await engineFor(mode);
@@ -601,24 +616,24 @@ async function dtPageId(page) {
     const list = await eng.text('list_pages', {});
     if (new RegExp(`^${page._wrDt.id}: `, 'm').test(list)) return page._wrDt.id;
   }
-  if (!page._wrMark) {
-    page._wrMark = `wr${process.pid}-${++markSeq}`;
-    await page.addInitScript((m) => { window.__wrMark = m; }, page._wrMark).catch(() => {});
-  }
-  // An open dialog blocks evaluate; don't wait on it.
-  await Promise.race([page.evaluate((m) => { window.__wrMark = m; }, page._wrMark).catch(() => {}), sleep(2000)]);
+  if (!page._wrMark) page._wrMark = `wr${process.pid}-${++markSeq}`;
   const want = JSON.stringify(page._wrMark);
-  for (let i = 0; i < 20; i++) {
-    const list = await eng.text('list_pages', {});
-    const rows = [...list.matchAll(/^(\d+): (.*)$/gm)].map((m) => ({ id: Number(m[1]), line: m[2] }));
-    const url = page.url();
-    const ordered = [...rows.filter((r) => r.line.includes(url)), ...rows.filter((r) => !r.line.includes(url))];
-    for (const r of ordered) {
-      const out = await eng.text('evaluate_script', { pageId: r.id, function: '() => window.__wrMark ?? null' }).catch(() => '');
-      if (out.includes(want)) { page._wrDt = { eng, id: r.id }; return r.id; }
+  // An open dialog blocks evaluate; don't wait on it.
+  const mark = (on) => Promise.race([page.evaluate(([k, m, on]) => { if (on) window[k] = m; else delete window[k]; }, [MARK_KEY, page._wrMark, on]).catch(() => {}), sleep(2000)]);
+  try {
+    for (let i = 0; i < 20; i++) {
+      await mark(true); // set again each round in case the page navigated
+      const list = await eng.text('list_pages', {});
+      const rows = [...list.matchAll(/^(\d+): (.*)$/gm)].map((m) => ({ id: Number(m[1]), line: m[2] }));
+      const url = page.url();
+      const ordered = [...rows.filter((r) => r.line.includes(url)), ...rows.filter((r) => !r.line.includes(url))];
+      for (const r of ordered) {
+        const out = await eng.text('evaluate_script', { pageId: r.id, function: `() => window[${JSON.stringify(MARK_KEY)}] ?? null` }).catch(() => '');
+        if (out.includes(want)) { page._wrDt = { eng, id: r.id }; return r.id; }
+      }
+      await sleep(150);
     }
-    await sleep(150);
-  }
+  } finally { await mark(false); }
   throw new Error('devtools 엔진이 이 페이지를 찾지 못했어요. open_page로 다시 열어 주세요.');
 }
 
@@ -762,6 +777,27 @@ async function navigateViaEngine(page, url) {
   } finally { page.off('response', onResp); }
 }
 
+// After the first load: network idle, or the page text has stopped changing for ~1 s,
+// whichever comes first (at most 10 s). Pages that never go network-idle (Google Maps,
+// sites with polling or ads) used to cost the full 10 s every time.
+async function loadSettled(page, maxMs = 10000) {
+  let done = false;
+  const idle = page.waitForLoadState('networkidle', { timeout: maxMs }).catch(() => {}).then(() => { done = true; });
+  const stable = (async () => {
+    const t0 = Date.now();
+    let last = -1, same = 0;
+    while (!done && Date.now() - t0 < maxMs) {
+      await page.waitForTimeout(350).catch(() => {});
+      const len = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => -1);
+      same = len === last && len >= 300 ? same + 1 : 0;
+      last = len;
+      if (same >= 3 && Date.now() - t0 >= 1200) return;
+    }
+  })();
+  await Promise.race([idle, stable]);
+  done = true;
+}
+
 async function tryOpen(mode, url, waitMs, headers, viaEngine = false) {
   const ctx = await getContext(mode);
   const page = await ctx.newPage();
@@ -778,7 +814,7 @@ async function tryOpen(mode, url, waitMs, headers, viaEngine = false) {
     await page.close().catch(() => {});
     throw e;
   }
-  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+  await loadSettled(page);
   // Give bot-check interstitials (Cloudflare etc.) time to pass on their own.
   const waitChallenge = mode === 'headed' ? 25 : 8;
   for (let i = 0; i < waitChallenge && CHALLENGE.test(await page.title().catch(() => '')); i++) {
@@ -908,7 +944,7 @@ export async function apiResponses({ page_id, url_filter, index, include_body = 
 // ---- API call from inside the logged-in page (page_fetch) ----
 // Runs fetch() in the open page with the page's cookies. Only the open page's own
 // site is allowed; methods other than GET/HEAD need allow_write (they can order,
-// pay, delete or post with the user's account). The response is not
+// pay, delete or post with the user's account). Per the user (2026-10-20) the response is not
 // masked here.
 export async function pageFetch({ page_id, url, method = 'GET', headers, body, json, allow_write = false, max_chars = 50000, offset = 0 }) {
   const page = sessionPage(page_id);
@@ -969,10 +1005,29 @@ export async function autoScroll(page, { max_steps = 25, max_ms = 15000, pause_m
 // page. Returns null (caller renders in Edge) for sites remembered as blocked,
 // non-HTML, error statuses, bot checks and pages too thin to be the content.
 const STATE_SCRIPT = /^\s*(\(?\s*self\.__next_f\s*=|self\.__next_f\.push|window\.__[A-Z0-9_]+__\s*=|window\[["']__[A-Z0-9_]+__["']\]\s*=|__NUXT__\s*=|window\.__NUXT__)/;
+// Fast-read failures are remembered per site + first path segment (tabelog.com/kr is
+// fine while tabelog.com/osaka gets 403), for a day, then fast is tried again.
+const FAST_FILE = path.join(HERE, 'sites-fast-blocked.json');
+const FAST_DAY = 24 * 3600 * 1000;
+const fastBlocked = (() => { try { return JSON.parse(fs.readFileSync(FAST_FILE, 'utf8')); } catch { return {}; } })();
+function fastKey(u) {
+  try { return `${siteOf(u)}/${new URL(u).pathname.split('/')[1] || ''}`; } catch { return ''; }
+}
+function rememberFast(key, reason) {
+  fastBlocked[key] = { reason, at: new Date().toISOString() };
+  try { fs.writeFileSync(FAST_FILE, JSON.stringify(fastBlocked, null, 1)); } catch {}
+}
 export async function fastOpen(url, headers) {
+  const r = await fastOpen1(url, headers);
+  const key = fastKey(url);
+  if (r.page && fastBlocked[key]) { delete fastBlocked[key]; try { fs.writeFileSync(FAST_FILE, JSON.stringify(fastBlocked, null, 1)); } catch {} }
+  if (/^(http_(403|429|503)|bot_check|thin_page_needs_rendering)$/.test(r.skipped || '')) rememberFast(key, r.skipped);
+  return { ...r, block_key: key };
+}
+async function fastOpen1(url, headers) {
   const t0 = Date.now();
-  const site = siteOf(url);
-  if (headedSites.has(site)) return { skipped: 'remembered_blocked_site' };
+  const mem = fastBlocked[fastKey(url)];
+  if (mem && Date.now() - Date.parse(mem.at) < FAST_DAY) return { skipped: 'remembered_blocked_site', remembered: mem.reason };
   const ctx = await getContext('headless');
   let resp;
   try { resp = await ctx.request.get(url, { timeout: 15000, maxRedirects: 10, headers: { ...(ctx._wrUa ? { 'User-Agent': ctx._wrUa } : {}), Accept: 'text/html,application/xhtml+xml', ...(headers || {}) } }); }
@@ -1585,7 +1640,7 @@ export async function savePlaces({ urls, list, action = 'save', tabs = 3, wait_m
   const lists = results.find((r) => r.lists)?.lists;
   return {
     list, action, tabs: n, browser: `${ctx._wrChannel}/${mode}`, count, results: results.map(({ lists: _, ...r }) => r),
-    ...(stop === 'not_logged_in' ? { note: '이 브라우저는 구글에 로그인돼 있지 않아요. 구글에 로그인된 PC의 web-reader로 하거나, open_page로 로그인 화면을 연 뒤 wait_for_human으로 사용자 로그인을 받으세요.' } : {}),
+    ...(stop === 'not_logged_in' ? { note: '이 브라우저는 구글에 로그인돼 있지 않아요. 구글에 로그인된 PC의 web-reader로 하거나, open_page로 로그인 화면을 연 뒤 wait_for_human으로 the user 로그인을 받으세요.' } : {}),
     ...(lists ? { lists_found: lists } : {}),
   };
 }
@@ -1603,6 +1658,62 @@ function asResult(obj) {
 async function safe(fn, args) {
   try { return asResult(await fn(args)); }
   catch (e) { return { isError: true, content: [{ type: 'text', text: `열기 실패: ${e.message}` }] }; }
+}
+
+// ---- bot-trace check, run after development and before deploying (node server.mjs --botcheck) ----
+// 1) code: no page-planting calls (they leave globals bot checks look for);
+// 2) live: a separate headless profile opens a local page and reports what the page can see.
+// Exit 0 = pass. Expected leftover: Playwright's own __playwright__binding__ (see README).
+const BOT_ALLOWED_GLOBALS = ['__playwright__binding__'];
+async function botcheck() {
+  const fails = [];
+  const PLANT = /\b(addInitScript|exposeFunction|exposeBinding)\s*\(/;
+  for (const f of fs.readdirSync(HERE).filter((n) => n.endsWith('.mjs'))) {
+    fs.readFileSync(path.join(HERE, f), 'utf8').split(/\r?\n/).forEach((line, i) => {
+      if (PLANT.test(line) && !/^\s*\/\//.test(line)) fails.push(`code ${f}:${i + 1} ${line.trim().slice(0, 100)}`);
+    });
+  }
+  const http = await import('node:http');
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(`<!doctype html><title>botcheck</title><pre id="h">${JSON.stringify(req.headers['user-agent'] || '')}</pre>`);
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const dir = path.join(HERE, 'profile-botcheck');
+  const env = { ...process.env, WEB_READER_PROFILE: dir, WEB_READER_HEADLESS_ONLY: '1', WEB_READER_SHARED: '0', WEB_READER_KEEP: '0' };
+  const client = new Client({ name: 'botcheck', version: VERSION });
+  let seen = null;
+  try {
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(import.meta.url)], env, stderr: 'ignore' }));
+    const call = async (name, args) => (await client.callTool({ name, arguments: args }, undefined, { timeout: 90000 })).content.map((c) => c.text || '').join('\n');
+    const opened = await call('open_page', { url: `http://127.0.0.1:${srv.address().port}/` });
+    const id = (opened.match(/"page_id":\s*"([^"]+)"/) || [])[1];
+    if (!id) throw new Error('open_page: ' + opened.slice(-300));
+    const FP = `async () => {
+      const w = new Worker(URL.createObjectURL(new Blob(['postMessage(navigator.userAgent)'])));
+      const worker = await new Promise((r) => { w.onmessage = (e) => r(e.data); setTimeout(() => r('timeout'), 3000); });
+      return { page: navigator.userAgent, worker, header: JSON.parse(document.getElementById('h').textContent), webdriver: navigator.webdriver,
+        globals: Object.getOwnPropertyNames(window).filter((k) => /^__|playwright|puppeteer|selenium|webdriver|cdc_|^_[0-9a-f]{12}$/i.test(k)) };
+    }`;
+    // Twice: the first call also runs the devtools page lookup, the second shows what it left behind.
+    for (let i = 0; i < 2; i++) {
+      const out = await call('evaluate_script', { page_id: id, function: FP, waitForStableDom: false });
+      seen = JSON.parse((out.match(/```json\s*([^]*?)```/) || [])[1] || 'null');
+      if (!seen) throw new Error('evaluate_script: ' + out.slice(-300));
+    }
+    await call('close_page', { page_id: id });
+  } catch (e) { fails.push('live ' + e.message.slice(0, 300)); }
+  await client.close().catch(() => {});
+  srv.close();
+  stopProfileBrowsers(dir);
+  if (seen) {
+    for (const k of ['page', 'worker', 'header']) if (/headless/i.test(seen[k])) fails.push(`live ${k} user agent says headless: ${seen[k]}`);
+    if (seen.webdriver !== false) fails.push(`live navigator.webdriver = ${seen.webdriver}`);
+    const extra = seen.globals.filter((g) => !BOT_ALLOWED_GLOBALS.includes(g));
+    if (extra.length) fails.push(`live page globals: ${extra.join(', ')}`);
+  }
+  console.log(JSON.stringify({ version: VERSION, pass: !fails.length, fails, seen }, null, 1));
+  return fails.length ? 1 : 0;
 }
 
 async function main() {
@@ -1642,6 +1753,7 @@ async function main() {
     await closeAll();
     process.exit(0);
   }
+  if (process.argv.includes('--botcheck')) process.exit(await botcheck());
   const testIdx = process.argv.indexOf('--test');
   if (testIdx > 0) {
     for (const url of process.argv.slice(testIdx + 1)) {

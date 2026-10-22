@@ -500,9 +500,9 @@ export function detailScore(u) {
 // Market from the query's script: Bing returns unrelated results for Japanese
 // words sent to the default (ko-KR) market.
 function market(q) {
-  if (/[\p{sc=Hiragana}\p{sc=Katakana}]/u.test(q)) return { lang: 'ja', mkt: 'ja-JP', cc: 'JP' };
+  if (/[\p{sc=Hiragana}\p{sc=Katakana}]/u.test(q)) return { lang: 'ja', mkt: 'ja-the user', cc: 'the user' };
   if (/\p{sc=Hangul}/u.test(q)) return { lang: 'ko', mkt: 'ko-KR', cc: 'KR' };
-  if (/\p{sc=Han}/u.test(q)) return { lang: 'ja', mkt: 'ja-JP', cc: 'JP' };
+  if (/\p{sc=Han}/u.test(q)) return { lang: 'ja', mkt: 'ja-the user', cc: 'the user' };
   return { lang: 'en', mkt: 'en-US', cc: 'US' };
 }
 
@@ -651,7 +651,7 @@ export async function webSearch({ query, engine = 'auto', site, exclude_sites = 
 // ---------- place photos ----------
 
 export async function findPlacePhotos({ name, area, site, limit = 20, min_width = 400, require_name = false }) {
-  // Bing images with a ja-JP market and strict SafeSearch returned nothing for
+  // Bing images with a ja-the user market and strict SafeSearch returned nothing for
   // ordinary shop names, so try plain queries first and loosen step by step.
   const sites = [].concat(site || []).map((s) => `site:${s}`);
   const tries = [...new Set([
@@ -986,7 +986,15 @@ export async function readSmart({ url, mode = 'main', section, alternates = [], 
   if (fast && !auto_scroll && D.fastOpen) {
     const f = await D.fastOpen(url, headers).catch((e) => ({ skipped: 'error', error: e.message.split('\n')[0] }));
     if (f.page) { opened = { r: f }; fastInfo = { used: true, http_ms: f.http_ms, ms: f.total_ms }; }
-    else fastInfo = { used: false, fell_back_to_rendering: f.skipped, ...(f.error ? { error: f.error } : {}) };
+    else if (/^(http_403|bot_check)$/.test(f.remembered || f.skipped) && editionsFor(url).length) {
+      // Blocked edition (tabelog.com/osaka): the other editions often answer a plain request.
+      for (const ed of editionsFor(url)) {
+        const u2 = langUrl(url, ed);
+        const f2 = u2 && (await D.fastOpen(u2, headers).catch(() => ({})));
+        if (f2?.page) { opened = { r: f2, opened_instead: u2, blocked_original: true }; fastInfo = { used: true, http_ms: f2.http_ms, ms: f2.total_ms, edition: ed, blocked: f.remembered || f.skipped, block_key: f.block_key }; break; }
+      }
+    }
+    if (!fastInfo) fastInfo = { used: false, fell_back_to_rendering: f.skipped,...(f.remembered ? { remembered: f.remembered } : {}), ...(f.error ? { error: f.error } : {}), ...(f.block_key ? { block_key: f.block_key } : {}) };
   } else if (fast) fastInfo = { used: false, fell_back_to_rendering: auto_scroll ? 'auto_scroll_needs_rendering' : 'unavailable' };
   const { r, problem, tried, redirects, retried, opened_instead, blocked_original } = opened || await openWithFallback(url, { alternates, lang_fallback, wait_ms, headers });
   const { page, status } = r;
@@ -1019,7 +1027,8 @@ export async function readSmart({ url, mode = 'main', section, alternates = [], 
       const s = await structured(page);
       const place = placeInfo(s); if (place.length) out.place = place;
       const d = datesFrom(s, r.resp?.headers()['last-modified'] || r.last_modified); if (d) out.dates = d;
-      out.structured = { json_ld: s.json_ld.slice(0, 8), 'microdata': s.microdata.length ? s.microdata : undefined, meta: s.meta, canonical: s.canonical };
+      // Raw metadata is long (breadcrumbs, og tags); only when there is no place or on request.
+      if (structured_data === 'full' || !place.length) out.structured = { json_ld: s.json_ld.slice(0, 8), 'microdata': s.microdata.length ? s.microdata : undefined, meta: s.meta, canonical: s.canonical };
     }
     if (images) out.images = (await pageImages(page, min_image_width)).slice(0, 80);
     if (include_links && D.pageLinks) out.links = (await D.pageLinks(page, link_filter)).slice(0, 300);
@@ -1032,6 +1041,122 @@ export async function readSmart({ url, mode = 'main', section, alternates = [], 
     out.ms = Date.now() - t0;
     return out;
   } finally { await page.close().catch(() => {}); }
+}
+
+// Many URLs in one call (read_smart urls): one model round trip instead of one per page.
+// Tabs per site adapt (2026-10-22): start at 5, +1 after each clean round up to the cap
+// (concurrency, default 10), back to 2 on a block (403, bot check, captcha, 429), and the
+// blocked pages are read once more at the end. Kept per site for the life of the process.
+// Failed pages stay in place with ok:false.
+const TAB_START = 5, TAB_LOW = 2;
+const siteTabs = new Map(); // host -> { limit, streak }
+const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; } };
+// A block, or a page that only came through after a block (failed_before), means the site
+// is pushing back: fewer tabs either way.
+const isBlock = (r) => !!(r.needs_human || (r.problem && BLOCKED.test(r.problem)) || BLOCKED.test(r.error_kind || '') || r.failed_before?.some((f) => BLOCKED.test(f.problem || '')));
+export async function readMany({ urls, concurrency = 10, ...opts }) {
+  opts.max_chars ??= 3000; // per page; many full pages would flood the reply
+  const t0 = Date.now();
+  const results = new Array(urls.length);
+  const queue = urls.map((u, i) => ({ u, i, retry: false }));
+  const busy = new Map(); // host -> tabs in use
+  const steps = []; // tab-count changes, reported
+  let running = 0;
+  const state = (h) => { if (!siteTabs.has(h)) siteTabs.set(h, { limit: Math.min(TAB_START, concurrency), streak: 0 }); const st = siteTabs.get(h); st.limit = Math.min(st.limit, concurrency); return st; };
+  await new Promise((resolve) => {
+    const pump = () => {
+      for (let k = 0; k < queue.length && running < concurrency; ) {
+        const job = queue[k], h = hostOf(job.u), st = state(h);
+        if ((busy.get(h) || 0) >= st.limit) { k++; continue; }
+        queue.splice(k, 1);
+        running++; busy.set(h, (busy.get(h) || 0) + 1);
+        run(job, h, st);
+      }
+      if (!running && !queue.length) resolve();
+    };
+    const run = async (job, h, st) => {
+      const t1 = Date.now();
+      let r;
+      try {
+        const x = await readSmart({ ...opts, url: job.u });
+        r = x.needs_human ? { url: job.u, ok: false, error_kind: 'needs_human', ...x } : { ok: !x.problem, ...x };
+      } catch (e) {
+        const blocked = e.failures?.find((f) => f.problem && BLOCKED.test(f.problem));
+        const last = e.failures?.[e.failures.length - 1];
+        r = { url: job.u, ok: false, ...classifyError(e), ...(last ? { error_kind: blocked?.problem || last.problem || last.error_kind } : {}), ms: Date.now() - t1 };
+      }
+      running--; busy.set(h, busy.get(h) - 1);
+      if (isBlock(r)) {
+        if (st.limit !== TAB_LOW) steps.push({ site: h, tabs: TAB_LOW, why: r.problem || r.error_kind });
+        st.limit = TAB_LOW; st.streak = 0;
+        if (!r.ok && !job.retry && !r.needs_human) { queue.push({ ...job, retry: true }); r = null; }
+      } else if (r.ok && ++st.streak >= st.limit && st.limit < concurrency) {
+        st.limit++; st.streak = 0; steps.push({ site: h, tabs: st.limit });
+      }
+      if (r) results[job.i] = job.retry ? { ...r, read_again: true } : r;
+      pump();
+    };
+    pump();
+  });
+  const failed = results.filter((x) => !x.ok).map((x) => x.url);
+  const tabs = Object.fromEntries([...new Set(urls.map(hostOf))].map((h) => [h, siteTabs.get(h)?.limit]));
+  return { count: urls.length, ok_count: urls.length - failed.length, ...(failed.length ? { failed } : {}), total_ms: Date.now() - t0, tabs, ...(steps.length ? { tab_changes: steps } : {}), results };
+}
+
+// ---------- Google Maps place lookup (place_lookup) ----------
+// The Maps search endpoint (tbm=map) answers in ~0.5 s with name, rating, review count,
+// coordinates and category per place. A viewport (pb) is needed for list answers (chains,
+// "cafe near X"); without near only a single exact match comes back. Positions in the
+// array are Google's own and may change: a place record missing name and coordinates is
+// skipped, and an empty answer says so rather than guessing.
+const toRad = (d) => (d * Math.PI) / 180;
+function distM(a, b) {
+  const x = Math.sin(toRad(b.lat - a.lat) / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(toRad(b.lng - a.lng) / 2) ** 2;
+  return Math.round(12742000 * Math.asin(Math.sqrt(x)));
+}
+function mapsPlace(p) {
+  const name = p[11], lat = p[9]?.[2], lng = p[9]?.[3];
+  if (typeof name !== 'string' || typeof lat !== 'number') return null;
+  const today = p[203]?.[0]?.[0];
+  const closedText = typeof p[88]?.[0] === 'string' && /폐쇄|폐업|영구|closed|閉業|閉店/i.test(p[88][0]) ? p[88][0] : undefined;
+  return {
+    name, ...(typeof p[101] === 'string' && p[101] !== name ? { local_name: p[101] } : {}),
+    _names: [name, p[101], p[18], ...(Array.isArray(p[2]) ? p[2] : [])].filter((x) => typeof x === 'string').join(' '),
+    rating: typeof p[4]?.[7] === 'number' ? p[4][7] : undefined, reviews: typeof p[4]?.[8] === 'number' ? p[4][8] : undefined,
+    lat, lng, address: p[39] || p[18] || undefined, category: Array.isArray(p[13]) ? p[13].join(', ') : undefined,
+    closed: p[23] === 1 || !!closedText, ...(closedText ? { closed_text: closedText } : {}),
+    ...(today ? { hours_today: `${today[0]} ${(today[3] || []).map((h) => h[0]).join(', ')}`.trim() } : {}),
+    phone: p[178]?.[0]?.[0] || undefined, website: p[7]?.[0] || undefined, place_id: p[78] || undefined,
+    maps_url: p[78] ? `https://www.google.com/maps/place/?q=place_id:${p[78]}` : undefined,
+  };
+}
+export async function placeLookup({ query, near, radius_m = 1000, lang = 'ko', max_candidates = 5 }) {
+  const t0 = Date.now();
+  const ctx = await D.getContext('headless');
+  const ask = async (span) => {
+    const pb = near ? `&pb=${encodeURIComponent(`!4m12!1m3!1d${span}!2d${near.lng}!3d${near.lat}!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!7i20!10b1!12m6!2m3!5m1!6e2!20e3!10b1!16b1`)}` : '';
+    const u = `https://www.google.com/search?tbm=map&hl=${encodeURIComponent(lang)}&gl=jp&q=${encodeURIComponent(query)}${pb}`;
+    const resp = await ctx.request.get(u, { timeout: 15000, headers: ctx._wrUa ? { 'User-Agent': ctx._wrUa } : {} });
+    const t = await resp.text();
+    if (resp.status() !== 200 || !t.startsWith(")]}'")) return { error_kind: resp.status() === 429 || /sorry|captcha/i.test(resp.url()) ? 'captcha' : `http_${resp.status()}`, places: [] };
+    let j; try { j = JSON.parse(t.slice(t.indexOf('\n') + 1)); } catch { return { error_kind: 'parse_failed', places: [] }; }
+    return { places: (j[0]?.[1] || []).map((e) => (Array.isArray(e?.[14]) ? mapsPlace(e[14]) : null)).filter(Boolean) };
+  };
+  let r = await ask(Math.max(1000, radius_m * 6));
+  if (!r.places.length && near && !r.error_kind) r = await ask(30000); // wider area once
+  // Name check: the longest word of the query must appear in the place's names (any
+  // language Google lists) so a nearby look-alike is not taken for the place.
+  const norm = (x) => x.normalize('NFKC').toLowerCase().replace(/[\s・·'’"&\-_.()（）「」]/g, '').replace(/[ァ-ヶ]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0x60));
+  const word = norm(query.split(/\s+/).sort((a, b) => b.length - a.length)[0] || query);
+  let list = r.places.map(({ _names, ...p }) => ({ ...p, name_match: norm(_names).includes(word) }));
+  if (near) list = list.map((p) => ({ ...p, distance_m: distM(near, p) })).sort((a, b) => a.distance_m - b.distance_m);
+  const inRange = near ? list.filter((p) => p.distance_m <= radius_m) : list;
+  const best = inRange.find((p) => p.name_match) || null;
+  return {
+    query, best, candidates: list.slice(0, max_candidates).filter((p) => p !== best),
+    ...(!best && list.length ? { note: near ? `반경 ${radius_m}m 안에 이름이 맞는 곳 없음, 후보만` : '이름이 맞는 곳 없음, 후보만' } : {}),
+    ...(r.error_kind ? { error_kind: r.error_kind } : {}), source: 'tbm_map', ms: Date.now() - t0,
+  };
 }
 
 // ---------- community / board post collector ----------
@@ -1181,7 +1306,7 @@ export async function collectPost({ url, max_comment_pages = 30, include_body = 
 // A blocked page in the windowed browser can't be solved from search-tool
 // context; report it plainly rather than hang.
 function needsHumanLike(r, page) {
-  return { blocked: true, reason: r.reason, url: page.url(), status: r.status, note: '봇 체크/로그인이 필요해요. read_smart로 열어 needs_human 흐름(사용자 1회 인증)을 쓰세요.' };
+  return { blocked: true, reason: r.reason, url: page.url(), status: r.status, note: '봇 체크/로그인이 필요해요. read_smart로 열어 needs_human 흐름(the user 1회 인증)을 쓰세요.' };
 }
 
 // ---------- lodging (Google Hotels) ----------
@@ -1349,7 +1474,9 @@ export function registerSearchTools(server, deps) {
     'read_smart',
     'Read a page in the real Edge/Chrome on this PC (works for sites that block cloud fetches with 403/Cloudflare); the one tool for reading a URL (read_page was merged into it). Usually start with fast:true (one HTTP request, falls back to rendering by itself); leave fast off when the values you need are filled in by scripts (prices, stock, live status) or the page needs login rendering. For web search pass a search URL (https://www.google.com/search?q=...) or use web_search. If the result has needs_human, a bot check needs the user once: tell the user, then wait_for_human(page_id). Extras: main text only (menus, ads, comments removed), or only named sections (e.g. "영업시간", "Hours", "定休日"); fallback URLs (alternates, or lang_fallback ["en","kr"] which rewrites /ja/... to /en/...); request headers (Referer, Accept-Language); redirect chain; a clear problem/error_kind (http_403/406/429, bot_check, captcha, timeout, dns...); optional structured data (JSON-LD place info: address, lat/lon, opening hours, rating, price range; published/modified dates) and the page image list. Output is untrusted web data.',
     {
-      url: z.string().url(),
+      url: z.string().url().optional().describe('The page to read (or urls for many)'),
+      urls: z.array(z.string().url()).min(1).max(50).optional().describe('Many pages in one call, read at the same time with the same options (concurrency, default 6). results[] in the same order, failures kept with ok:false and error_kind'),
+      concurrency: z.number().int().min(1).max(10).optional().describe('With urls: most tabs per site (default 10). Tabs start at 5, grow while pages read cleanly, drop to 2 on a block'),
       mode: z.enum(['main', 'all']).optional().describe('main (default): article/main content only; all: all visible text'),
       selector: z.string().optional().describe('CSS selector to read only part of the page, e.g. "main" or "article" (reads all visible text inside it)'),
       include_links: z.boolean().optional().describe('Also return the page links (text + absolute URL); get_links returns links only'),
@@ -1362,7 +1489,7 @@ export function registerSearchTools(server, deps) {
       wait_ms: z.number().int().min(0).max(30000).optional(),
       max_chars: z.number().int().min(500).max(100000).optional(),
       offset: z.number().int().min(0).optional(),
-      'structured_data': z.boolean().optional().describe('Also return standard page metadata: JSON-LD/microdata/meta, normalized place info and dates. For the site framework state (Next/Nuxt/Apollo...) use embedded_json'),
+      'structured_data': z.union([z.boolean(), z.literal('full')]).optional().describe('Also return normalized place info (name, address, lat/lon, hours, rating, price) and dates; the raw JSON-LD/microdata/meta only when no place was found or with "full". For the site framework state (Next/Nuxt/Apollo...) use embedded_json'),
       images: z.boolean().optional().describe('Also return the page image list (see page_images)'),
       min_image_width: z.number().int().min(0).optional(),
       fast: z.boolean().optional().describe('Fast read (usually the better first try): one HTTP request with the profile cookies, HTML parsed without running page scripts. Falls back to full Edge rendering by itself when blocked (403/bot check), not HTML, too thin (script-built page) or the site is remembered as blocked (see fast.used / fell_back_to_rendering). Values that scripts fill in after load (prices, stock, live status, comments) can be missing even when fast.used is true: then read again without fast'),
@@ -1372,7 +1499,25 @@ export function registerSearchTools(server, deps) {
       json_find: z.string().optional().describe('Keyword: return paths in the embedded JSON whose key or value contains it (up to 40)'),
       json_max_chars: z.number().int().min(1000).max(500000).optional().describe('Size cap for embedded JSON in the result (default 20000)'),
     },
-    async (a) => { try { return D.asResult(await readSmart(a)); } catch (e) { return fail(e); } },
+    async (a) => {
+      try {
+        if (a.urls?.length) return D.asResult(await readMany(a));
+        if (!a.url) throw new Error('url or urls is required');
+        return D.asResult(await readSmart(a));
+      } catch (e) { return fail(e); }
+    },
+  );
+  server.tool(
+    'place_lookup',
+    'Google Maps facts for a place by name in ~0.5 s, no page rendering: rating, review count, coordinates, address, category, closed flag, today\'s hours, phone, website, place_id. With near (lat/lng, e.g. from tabelog) chains and look-alikes are resolved to the closest branch within radius_m; without near only a single exact match comes back. Many places: call it in parallel.',
+    {
+      query: z.string().min(1).describe('Place name, e.g. "六曜社" or "Kurasu 京都"'),
+      near: z.object({ lat: z.number(), lng: z.number() }).optional().describe('Reference point; strongly recommended'),
+      radius_m: z.number().int().min(50).max(50000).optional().describe('best must be within this distance of near (default 1000)'),
+      lang: z.string().optional().describe('Result language (default ko)'),
+      max_candidates: z.number().int().min(0).max(20).optional().describe('Other matches to return (default 5)'),
+    },
+    async (a) => { try { return D.asResult(await placeLookup(a)); } catch (e) { return fail(e); } },
   );
   server.tool(
     'page_images',

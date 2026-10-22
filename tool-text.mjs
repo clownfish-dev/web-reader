@@ -1,6 +1,6 @@
 // Short tool and parameter descriptions: what Claude sees in the tool list (0.9.1).
 // Kept to what is needed to pick a tool, its key options and the one-line pointer to the
-// usually better tool; details live in README.md. Applied at
+// usually better tool; details live in web-reader-사용법.md / README. Applied at
 // tools/list time to web-reader's own tools and the devtools engine tools alike, so the
 // long texts in server.mjs / search.mjs stay as the detailed reference.
 
@@ -8,7 +8,7 @@ const DT = ' [devtools: page_id from open_page, uids from take_snapshot]';
 
 export const DESC = {
   // reading
-  read_smart: 'Read a URL in the real browser (the one reading tool). Usually fast:true first (falls back to rendering by itself); leave fast off for values scripts fill in (prices, stock, live status). Options: section, selector, mode, include_links, structured_data, embedded_json, images, auto_scroll, alternates/lang_fallback. needs_human → tell the user, then wait_for_human. Searching: web_search.',
+  read_smart: 'Read a URL in the real browser (the one reading tool). Usually fast:true first (falls back to rendering by itself); leave fast off for values scripts fill in (prices, stock, live status). Many pages: urls (up to 50, read together, one call). Options: section, selector, mode, include_links, structured_data, embedded_json, images, auto_scroll, alternates/lang_fallback. needs_human → tell the user, then wait_for_human. Searching: web_search.',
   web_search: 'Web search (Google, then Bing/DuckDuckGo if blocked): title, URL, snippet; fetch_top also reads the top N results. Filter with site / exclude_sites / prefer_detail.',
   get_links: 'Links on a rendered page (text + absolute URL).',
   check_domains: 'Which sites open from this PC: status, redirect, title, bot check, error kind. use_browser for JS bot checks.',
@@ -16,12 +16,13 @@ export const DESC = {
   hotel_search: 'Google Hotels for fixed dates: name, nightly price, rating, reviews, stars, amenities.',
   transit_route: 'Google Maps route options: duration, times, line/road, fare. mode transit (default) / driving / walking / bicycling.',
   // images, maps
+  place_lookup: 'Google Maps rating, reviews, coordinates, address, category, closed flag, hours by place name (~0.5 s, no rendering). Pass near (lat/lng) to pick the right branch within radius_m.',
   page_images: 'Images on a page (og, JSON-LD, img/srcset/lazy, alt, size). Download with fetch_images.',
   find_place_photos: 'Real photos of a named place via image search (URL, source page, size, name_match). Check with contact_sheet.',
   fetch_images: 'Download many images through the browser (same cookies/UA, pacing, backoff, cache, optional resize/thumbnails) into the data folder.',
   contact_sheet: 'One numbered thumbnail grid from downloaded files or image URLs, to check photos at a glance.',
   static_map: 'Map PNG with numbered pins, labels and an optional route line.',
-  save_places: 'Google Maps: save / remove / check many place links in one named list (up to 4 tabs, verified per link). Needs the browser logged in to Google. Re-check after ~1 min.',
+  save_places: 'Google Maps: save / remove / check many place links in one named list (up to 4 tabs, verified per link). Main PC only (Google login). Re-check after ~1 min.',
   // open pages
   open_page: 'Open a URL and keep it open; returns page_id for click/scroll/screenshot/read_open_page and the devtools tools. Records network, console and JSON API responses from the first request. Closes after 10 min unused. Different page_ids run in parallel. One-off reading: read_smart. Fails with "프로필 사용 중" if the login profile is held elsewhere.',
   read_open_page: 'Current text/links of an open page after clicks or scrolls; auto_scroll loads lazy content first.',
@@ -64,13 +65,15 @@ export const PDESC = {
   'read_smart.fast': 'One HTTP request, no page scripts; falls back to rendering when blocked/thin (fast.used). Script-filled values can be missing',
   'read_smart.embedded_json': 'Framework JSON in the page (Next, Nuxt, Apollo, __INITIAL_STATE__...); large → shape only, pick with json_paths/json_find. Standard metadata: structured_data',
   'read_smart.auto_scroll': 'Scroll to the bottom first for lazy content (renders, max ~15 s, reached_limit). Step by step: open_page + scroll',
-  'read_smart.structured_data': 'JSON-LD/microdata/meta, place info, dates. Framework state: embedded_json',
   'read_smart.json_paths': 'Paths in the embedded JSON, e.g. ["next_data.props.pageProps"]',
   'read_smart.json_find': 'Keyword: paths whose key or value contains it',
   'read_smart.include_hidden': 'Also return text hidden from people (hidden_text), separately',
   'read_smart.selector': 'CSS selector to read only that part',
   'read_smart.include_links': 'Also return the page links',
   'read_smart.headers': 'Extra request headers (Referer, Accept-Language...)',
+  'read_smart.urls': 'Many URLs, same options; results[] in order, failures kept (ok:false). Default max_chars 3000 each',
+  'read_smart.concurrency': 'With urls: max tabs per site (default 10; starts at 5, +1 while clean, 2 after a block)',
+  'read_smart.structured_data': 'Place info (name, address, lat/lon, rating, hours, price) and dates; raw JSON-LD/meta only if no place or "full"',
   'read_smart.mode': 'main (default): main content; all: all visible text',
   'web_search.fetch_top': 'Also read the top N results (default 0); blocked ones retried directly / other language edition',
   'web_search.structured_data': 'For fetched results: place info and dates',
@@ -122,9 +125,18 @@ function shortenProps(name, props) {
   }
 }
 
+// Tools marked read-only. Claude Code runs several calls of an MCP tool at the same time
+// only when the tool says readOnlyHint (otherwise one after another, measured 2026-10-22:
+// 4 read_smart in one message took the sum of their times). Calls on one page_id still
+// queue inside web-reader.
+const READ_ONLY = new Set(['read_smart', 'web_search', 'get_links', 'check_domains', 'collect_post', 'hotel_search', 'transit_route',
+  'place_lookup', 'page_images', 'find_place_photos', 'open_page', 'read_open_page', 'screenshot', 'close_page', 'api_responses',
+  'take_snapshot', 'list_network_requests', 'get_network_request', 'list_console_messages', 'get_console_message']);
+
 // Returns a shortened copy of one tool entry from tools/list.
 export function shortTool(t) {
   const out = { ...t, inputSchema: JSON.parse(JSON.stringify(t.inputSchema || {})) };
+  if (READ_ONLY.has(t.name)) out.annotations = { ...t.annotations, readOnlyHint: true };
   if (DESC[t.name]) out.description = DESC[t.name];
   delete out.inputSchema.$schema;
   shortenProps(t.name, out.inputSchema.properties);
