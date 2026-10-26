@@ -1,20 +1,17 @@
-# installed packages
-node_modules/
-devtools/node_modules/
+# made on each PC by setup.bat
+.venv/
+browsers/
+__pycache__/
+*.egg-info/
 
-# dedicated Edge copy (made on each PC, see README)
-edge/
-
-# browser profiles: contain logins and cookies, never share
+# browser profile: contains logins and cookies, never share
 profile*/
-run/
 
-# downloads, cache, call.mjs output
+# logins, cache, service port/token, logs, notes
 data/
 
-# per-PC settings and site list
-web-reader.config.json
-sites-headed.json
+# tool docs written at start
+docs/tools/
 
 *.log
 *.bak*

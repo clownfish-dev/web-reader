@@ -1,0 +1,22 @@
+{
+  "_about": "Site recipes kept out of the code: language editions to try when one is blocked, notes attached to read results, section synonyms. Edit here, not in read.py. User notes added at run time live in data/site-notes.json.",
+  "section_synonyms": [
+    ["営業時間", "Opening hours", "Hours", "Business hours", "영업시간", "営業時間・定休日"],
+    ["定休日", "年中無休", "Open year-round", "연중무휴", "Closed", "Closed days", "Days closed", "Shop holidays", "Holidays", "Regular holiday", "휴무", "휴무일", "정기휴일", "休業日", "休み"],
+    ["住所", "Address", "주소", "所在地"],
+    ["予算", "Budget", "Price", "가격", "料金", "入場料", "Admission"],
+    ["アクセス", "Access", "交通手段", "Transportation", "교통"]
+  ],
+  "sites": {
+    "tabelog.com": {
+      "lang_editions": ["kr", "en"],
+      "note": "일본어판(/osaka/...)은 확인 화면이 잦아요. /kr/·/en/판이 HTTP로 빨리 열려요(2026-10-20 web-reader 측정). 가게 정보는 structured_data, 영업시간은 section:\"영업시간\"."
+    },
+    "google.com": {
+      "note": "지도 장소는 place_lookup(0.3~0.5초)이 read보다 빠르고 정확해요. 구글 로그인은 기기에 묶여 쿠키 복사가 안 돼요: login으로 이 브라우저에서 한 번."
+    },
+    "dcinside.com": {
+      "note": "게시글 본문·댓글은 collect_post가 정확해요."
+    }
+  }
+}

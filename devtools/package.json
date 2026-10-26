@@ -1,1 +1,0 @@
-{ "name": "web-reader-devtools", "private": true, "dependencies": { "chrome-devtools-mcp": "1.11.0" } }
