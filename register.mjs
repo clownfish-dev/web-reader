@@ -1,4 +1,4 @@
-// Registers web-reader 1.0.0 (Scrapling fork, fork\scrapling\webreader) as the MCP server "web-reader" for Claude Code on this PC,
+// Registers web-reader (Scrapling fork, fork\scrapling\webreader) as the MCP server "web-reader" for Claude Code on this PC,
 // replacing web-reader 0.9.4's entry and the interim "scrapling" entry:
 // user scope in ~/.claude.json, and also in a project .mcp.json when given (where web-reader is
 // registered for a project). Backs up each file first, keeps every other entry, checks the JSON.
@@ -40,4 +40,4 @@ function add(file) {
 add(path.join(os.homedir(), '.claude.json'));
 const i = argv.indexOf('--mcp-json');
 if (i >= 0 && argv[i + 1]) add(argv[i + 1]);
-console.log('Done. Open a new Claude session to see the web-reader 1.0.0 tools.');
+console.log('Done. Open a new Claude session to see the web-reader tools.');

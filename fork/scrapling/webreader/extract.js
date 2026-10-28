@@ -72,23 +72,46 @@ const wr = {
   // block; else text windows around the keyword.
   sections({ kws, maxEach }) {
     const vis = (el) => { const r = el.getBoundingClientRect(); const cs = getComputedStyle(el); return cs.display !== 'none' && cs.visibility !== 'hidden' && (r.width > 0 || r.height > 0); };
-    const clean = (s) => (s || '').replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-    const out = []; const seen = new Set();
+    // Line starts keep their spaces (code indentation); runs of blank lines and trailing spaces go.
+    const clean = (s) => (s || '').replace(/(\S)[ \t]{2,}/g, '$1 ').replace(/[ \t]+\n/g, '\n').replace(/\n\s*\n(\s*\n)+/g, '\n\n').replace(/^\s*\n|\s+$/g, '');
+    const norm = (s) => s.replace(/\s+/g, ' ').trim();
+    const out = []; const seen = [];
     const add = (kw, how, label, text) => {
-      text = clean(text); if (!text || seen.has(text)) return; seen.add(text);
-      out.push({ keyword: kw, how, label: clean(label).slice(0, 120), text: text.slice(0, maxEach) });
+      text = clean(text); const n = norm(text); if (!n) return;
+      // The same part found again (as a block, with its heading line, in a menu copy) is left out.
+      if (seen.some((x) => x.includes(n) || (n.includes(x) && n.length < x.length * 1.5))) return;
+      seen.push(n);
+      const item = { keyword: kw, how, label: clean(label).slice(0, 120), text: text.slice(0, maxEach) };
+      if (text.length > maxEach) item.truncated = true;
+      out.push(item);
+    };
+    // A heading's level, also for wrappers that hold only a heading and its anchor (GitHub READMEs).
+    const level = (n) => {
+      if (/^H[1-6]$/.test(n.tagName)) return +n.tagName[1];
+      const h = n.children.length <= 3 && n.querySelector(':scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5,:scope > h6');
+      return h && norm(n.innerText || '') === norm(h.innerText || '') ? +h.tagName[1] : 0;
     };
     for (const kw of kws) {
       const k = kw.toLowerCase();
       const cands = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,dt,th,caption,summary,legend,label,strong,b,[class*="title" i],[class*="label" i],[class*="heading" i]')]
-        .filter((el) => { const t = (el.innerText || '').trim(); return t && t.length <= 80 && t.toLowerCase().includes(k) && vis(el); });
+        .filter((el) => { const t = (el.innerText || '').trim(); return t && t.length <= 80 && t.toLowerCase().includes(k) && vis(el) && !el.closest('nav,[role=navigation]'); })
+        .sort((a, b) => /^H[1-6]$/.test(b.tagName) - /^H[1-6]$/.test(a.tagName));
+      // A heading's section answers it; labelled blocks are read only when no heading matched.
+      let byHeading = false;
       for (const el of cands.slice(0, 12)) {
         const tag = el.tagName;
         if (/^H[1-6]$/.test(tag)) {
-          const lvl = +tag[1]; let t = ''; let n = el.nextElementSibling;
-          while (n && !(/^H[1-6]$/.test(n.tagName) && +n.tagName[1] <= lvl) && t.length < maxEach) { t += '\n' + (n.innerText || ''); n = n.nextElementSibling; }
-          if (!t.trim()) t = el.parentElement?.innerText || '';
+          const lvl = +tag[1]; let start = el;
+          while (start.parentElement && level(start.parentElement) === lvl) start = start.parentElement;
+          let t = ''; let n = start.nextElementSibling;
+          while (n && !(level(n) && level(n) <= lvl) && t.length <= maxEach) { t += '\n' + (n.innerText || ''); n = n.nextElementSibling; }
+          if (!norm(t)) {
+            const p = el.parentElement?.innerText || '';
+            if (norm(p).length <= norm(el.innerText).length + 8) continue;
+            t = p;
+          }
           add(kw, 'heading', el.innerText, t);
+          byHeading = true;
         } else if (tag === 'DT') {
           let t = ''; let n = el.nextElementSibling;
           while (n && n.tagName === 'DD') { t += '\n' + n.innerText; n = n.nextElementSibling; }
@@ -102,7 +125,7 @@ const wr = {
             const col = tbl ? [...tbl.querySelectorAll('tr')].map((r) => r.children[idx]?.innerText || '').filter(Boolean).slice(1).join('\n') : '';
             add(kw, 'table_col', el.innerText, col);
           }
-        } else {
+        } else if (!byHeading) {
           let p = el.parentElement; const own = (el.innerText || '').trim().length;
           while (p && p !== document.body && (p.innerText || '').trim().length < own + 8) p = p.parentElement;
           if (p && p !== document.body && (p.innerText || '').length < maxEach * 2) add(kw, 'block', el.innerText, p.innerText);
@@ -117,6 +140,23 @@ const wr = {
       }
     }
     return out;
+  },
+
+  // Headings of a long page (h1-h4 outside menus), indented by level, up to max characters.
+  outline({ max }) {
+    const lines = []; const seen = new Set(); let used = 0;
+    for (const h of document.querySelectorAll('h1,h2,h3,h4')) {
+      if (h.closest('nav,header,footer,aside,[role=navigation]')) continue;
+      const cs = getComputedStyle(h);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const t = (h.innerText || '').replace(/\s+/g, ' ').replace(/\s*\[(편집|edit|編集)\]\s*$/i, '').replace(/\s*[¶§#]\s*$/, '').trim();
+      if (!t || t.length > 80 || seen.has(t)) continue;
+      seen.add(t);
+      const line = '  '.repeat(Math.max(0, +h.tagName[1] - 2)) + t;
+      if (used + line.length > max) break;
+      lines.push(line); used += line.length + 1;
+    }
+    return lines.join('\n');
   },
 
   // JSON-LD, microdata, meta, <time> and canonical.

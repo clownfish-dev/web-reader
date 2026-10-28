@@ -128,31 +128,52 @@ def _kind(p: Dict[str, Any]) -> str:
     return t
 
 
+def _param(name: str, p: Dict[str, Any], required: bool) -> str:
+    """`name* type =default min-max`: * required; false and 0 defaults are left out."""
+    bits = [name + ("*" if required else ""), _kind(p)]
+    if not required and "default" in p and p["default"] is not False and p["default"] != 0:
+        bits.append("=" + json.dumps(p["default"], ensure_ascii=False))
+    if "minimum" in p or "maximum" in p:
+        bits.append(f"{p.get('minimum', '')}-{p.get('maximum', '')}")
+    if "maxItems" in p:
+        bits.append(f"max {p['maxItems']}")
+    return " ".join(b for b in bits if b)
+
+
 def _param_lines(schema: Dict[str, Any]) -> List[str]:
     req = set(schema.get("required") or [])
-    out = []
-    for name, p in (schema.get("properties") or {}).items():
-        bits = [f"`{name}`", _kind(p)]
-        if name in req:
-            bits.append("(required)")
-        elif "default" in p:
-            bits.append(f"(default {json.dumps(p['default'], ensure_ascii=False)})")
-        for k in ("minimum", "maximum", "maxItems"):
-            if k in p:
-                bits.append(f"{k} {p[k]}")
-        if p.get("description"):
-            bits.append("— " + p["description"])
-        out.append("- " + " ".join(b for b in bits if b))
-    return out
+    return [f"- {_param(n, p, n in req)}" + (f" — {p['description']}" if p.get("description") else "")
+            for n, p in (schema.get("properties") or {}).items()]
+
+
+def _def_line(dname: str, d: Dict[str, Any], said: set) -> str:
+    """One line per type; an action variant is named by its `type` value. A parameter text already given
+    in an earlier type is not repeated."""
+    if not d.get("properties"):
+        return f"- {dname}: {_kind(d)}" + (f" — {d['description']}" if d.get("description") else "")
+    props = dict(d["properties"])
+    label = dname
+    if "const" in props.get("type", {}):
+        label = f"{dname} (type {json.dumps(props.pop('type')['const'])})"
+    req = set(d.get("required") or [])
+    parts = []
+    for n, p in props.items():
+        part = _param(n, p, n in req)
+        desc = (p.get("description") or "").rstrip(".")
+        if desc and (part, desc) not in said:
+            said.add((part, desc))
+            part += f" ({desc})"
+        parts.append(part)
+    return f"- {label}: " + "; ".join(parts)
 
 
 def _usage_text(name: str, desc: str, schema: Dict[str, Any]) -> str:
-    lines = [f"# {name}", "", " ".join(desc.split()), "", "## Parameters", ""] + (_param_lines(schema) or ["(none)"])
+    lines = [f"# {name}", "", " ".join(desc.split()), "", "Parameters (* required):"] + (_param_lines(schema) or ["(none)"])
     defs = schema.get("$defs") or {}
-    for dname, d in defs.items():
-        lines += ["", f"### {dname}", ""] + (_param_lines(d) if d.get("properties") else [f"- {_kind(d)}" + (" — " + d["description"] if d.get("description") else "")])
-    lines += ["", "_Written by the server at start from the tool's docstring (scrapling/webreader/tooltext.py); edits here are overwritten._", ""]
-    return "\n".join(lines)
+    if defs:
+        said: set = set()
+        lines += ["", "Types:"] + [_def_line(n, d, said) for n, d in defs.items()]
+    return "\n".join(lines) + "\n"
 
 
 def write_usage(full: Dict[str, Any]) -> None:

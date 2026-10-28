@@ -1,4 +1,4 @@
-# web-reader 1.0.0
+# web-reader 1.0.2
 
 사용자의 웹 도구예요. Scrapling 0.5 개조판으로, 소스는 `fork\`(git), 개조한 부분은 `fork\scrapling\webreader\`에 있어요. `.venv`에 이 개조판이 편집 모드로 깔려 있어요. Claude Code에는 MCP 이름 `web-reader`로 등록돼요.
 

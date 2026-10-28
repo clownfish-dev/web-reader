@@ -66,6 +66,15 @@ def relevant(text: str, query: str, max_chars: int, k1: float = 1.5, b: float = 
     return "\n\n".join(parts), {"paragraphs": n, "kept": len(keep)}
 
 
+def clip(s: str, limit: int) -> str:
+    """At most limit characters, cut at a word."""
+    s = " ".join((s or "").split())
+    if len(s) <= limit:
+        return s
+    cut = s[: limit - 1]
+    return (cut[: cut.rfind(" ")] if " " in cut else cut).rstrip(",;:·|-") + "…"
+
+
 _LINK = re.compile(r"(?<!!)\[([^\]\n]{0,300})\]\(([^)\s]+)\)")
 
 

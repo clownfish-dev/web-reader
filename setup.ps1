@@ -1,4 +1,4 @@
-# Install web-reader 1.0.0 (Scrapling fork) on this PC from this folder (fork\, register.mjs, ...).
+# Install web-reader (Scrapling fork) on this PC from this folder (fork\, register.mjs, ...).
 # Run from the folder:
 #   powershell -ExecutionPolicy Bypass -File setup.ps1 [-Headless] [-McpJson <path>] [-OldWebReader <0.9.4 folder>] [-ProfileFrom <folder>] [-NoRegister]
 # Steps: venv -> Scrapling 0.5 deps + this fork (editable) -> browser into .\browsers (+ AppContainer read)

@@ -232,6 +232,16 @@ async def _resolve_google(results: List[Dict[str, Any]]) -> None:
         await asyncio.sleep(0.15)
 
 
+def _tidy(x: Dict[str, Any]) -> Dict[str, Any]:
+    """A result without what repeats elsewhere: the snippet's "Read more" and a display_url that only
+    restates the URL (kept when it carries something else, like likes and age)."""
+    x = {**x, "snippet": re.sub(r"\s*(Read more|더보기|もっと見る)\s*$", "", x.get("snippet") or "")}
+    d = x.get("display_url")
+    if d and (re.match(r"https?://", d) or "›" in d or "." in d.split(" ")[0]):
+        x.pop("display_url")
+    return x
+
+
 async def web_search(query: str, engine: str = "auto", site: Any = None, exclude_sites: Optional[List[str]] = None, prefer_detail: bool = False,
                      limit: int = 10, fetch_top: int = 0, read: str = "main", section: Any = None, max_chars_each: int = 3000, structured_data: bool = False) -> Dict[str, Any]:
     exclude_sites = exclude_sites or []
@@ -292,9 +302,9 @@ async def web_search(query: str, engine: str = "auto", site: Any = None, exclude
         if not on and out:
             site_note = f"{', '.join(sites)} 안의 결과가 없어요(검색엔진이 사이트 밖 결과만 줌). 검색어를 바꾸거나 site 없이 찾아 보세요."
         out = on
-    out = [{"rank": i + 1, **x, "detail_score": detail_score(x["url"])} for i, x in enumerate(out)]
+    out = [{"rank": i + 1, **_tidy(x)} for i, x in enumerate(out)]
     if prefer_detail:
-        out.sort(key=lambda x: (-x["detail_score"], x["rank"]))
+        out.sort(key=lambda x: (-detail_score(x["url"]), x["rank"]))
     out = out[:limit]
     for x in out[:fetch_top]:
         t0 = time.monotonic()

@@ -37,6 +37,11 @@ CHALLENGE = re.compile(r"just a moment|잠시만 기다|attention required|check
 CAPTCHA_TEXT = re.compile(r"unusual traffic|비정상적인 트래픽|i'm not a robot|로봇이 아닙니다|verify you are human|사람인지 확인|captcha", re.I)
 CHALLENGE_HTML = re.compile(r"challenge-platform|__cf_chl|cf-turnstile|g-recaptcha|h-captcha|captcha-delivery|px-captcha|_Incapsula_Resource", re.I)
 BLOCKED = re.compile(r"^(bot_check|captcha|challenge_page|http_403|http_429)")
+# Pages a site redirects to instead of the asked page when it suspects a bot.
+BOT_URL = re.compile(r"amazon\.[a-z.]+/(checkpoint/|errors/validateCaptcha)|/sorry/|captcha|js_challenge|__cf_chl|challenge-platform|[?&]chal_t=", re.I)
+# Long pages without section/query/selector or an explicit max_chars: outline + this much text.
+LONG_PAGE = 15000
+LONG_HEAD = 1500
 # Site recipes (language editions, section synonyms, notes) live in sites.json via sites.py.
 HTTP_BLOCKED_FILE = ROOT / "data" / "sites-http-blocked.json"
 HTTP_BLOCK_DAY = 24 * 3600
@@ -144,7 +149,7 @@ def _html_problem(html: str, status: int) -> Optional[str]:
 def _probe_problem(p: Dict[str, Any], url: str, status: int) -> Optional[str]:
     if CHALLENGE.search(p.get("title") or ""):
         return "challenge_page"
-    if re.search(r"/sorry/|captcha|js_challenge|__cf_chl|challenge-platform", url, re.I):
+    if BOT_URL.search(url):
         return "captcha"
     if p["len"] < 1500 and (p["frame"] or CAPTCHA_TEXT.search(p["head"])):
         return "captcha"
@@ -278,8 +283,9 @@ async def auto_scroll(page: Any, max_steps: int = 25, max_ms: int = 15000, pause
     return out
 
 
-async def _settle(page: Any, max_ms: int = 10000) -> None:
-    """After load: return once the network is quiet or the text stops changing for ~1 s (max 10 s)."""
+async def _settle(page: Any, max_ms: int = 8000) -> None:
+    """After load: return once the network is quiet or the text stays about the same for 1 s (max 8 s).
+    "About": within 2% (50 chars at least), so rotating banners and live counters do not hold the read."""
     t0 = time.monotonic()
     idle = asyncio.ensure_future(page.wait_for_load_state("networkidle", timeout=max_ms))
     last, same = -1, 0
@@ -290,7 +296,7 @@ async def _settle(page: Any, max_ms: int = 10000) -> None:
                 n = await page.evaluate("() => (document.body && document.body.innerText || '').length")
             except Exception:
                 break
-            same = same + 1 if n == last else 0
+            same = same + 1 if last >= 0 and abs(n - last) <= max(50, last * 0.02) else 0
             last = n
             if same >= 4 and n > 0:
                 break
@@ -327,12 +333,19 @@ def next_steps(r: Dict[str, Any], url: str) -> List[str]:
         out.append("사용자에게 사이트를 알리고 wait_for_human(session_id)")
     elif r.get("problem"):
         out.append("막혔으면 engine=browser, 그래도 막히면 login(url) 또는 사용자 손")
-    if r.get("next_offset"):
+    if r.get("outline"):
+        out.append("긴 페이지라 목차와 앞부분만: section=[목차 제목] 또는 query로 필요한 곳만, 통째로는 max_chars")
+    elif r.get("next_offset"):
         out.append(f"나머지 글: offset={r['next_offset']}")
+    hidden = r.get("hidden_chars_removed") or 0
+    if hidden > 3 * (r.get("total_chars") or 0) and hidden > 3000:
+        out.append("숨겨진 글이 많아요: 스크롤해야 나타나면 auto_scroll=true, 숨긴 글은 include_hidden=true")
+    if any(s.get("truncated") for s in r.get("sections") or []):
+        out.append("잘린 칸(truncated)은 max_chars를 늘려 다시")
     if LISTY.search(r.get("url") or url) and not r.get("table"):
         out.append("목록 페이지면 table=true로 항목을 표로")
-    if (r.get("total_chars") or 0) > 15000 and not r.get("query_filter") and not r.get("sections"):
-        out.append("긴 페이지: section(칸 이름) 또는 urls와 query로 필요한 문단만")
+    if (r.get("total_chars") or 0) > LONG_PAGE and not r.get("outline") and not r.get("query_filter") and not r.get("sections"):
+        out.append("긴 페이지: section(칸 이름) 또는 query로 필요한 문단만")
     return out[:3]
 
 
@@ -417,7 +430,7 @@ class Reader:
         if ctype and "html" not in ctype.lower():
             return {"skipped": "not_html", "content_type": ctype[:80], "http_ms": http_ms}
         html = _decode(resp)
-        problem = _html_problem(html, resp.status)
+        problem = _html_problem(html, resp.status) or ("bot_check" if BOT_URL.search(str(resp.url)) else None)
         if problem:
             if BLOCKED.match(problem):
                 _remember_http_block(key, problem)
@@ -428,9 +441,9 @@ class Reader:
         page = session.page
         await page.set_content(_static_html(html), wait_until="domcontentloaded")
         n = await page.evaluate("() => (document.body && document.body.innerText || '').trim().length")
-        # Short and built by scripts: render it. Short without scripts (example.com) is simply short:
-        # rendering it again cost ~0.8 s for nothing (measured).
-        if n < 300 and re.search(r"<script\b[^>]*\bsrc=|<script\b[^>]*>\s*\S{200}", html, re.I):
+        # Short and built by scripts (a shell whose items scripts fill in): render it. Short without
+        # scripts (example.com) is simply short: rendering it again cost ~0.8 s for nothing (measured).
+        if n < 1500 and re.search(r"<script\b[^>]*\bsrc=|<script\b[^>]*>\s*\S{200}", html, re.I):
             await session.close()
             return {"skipped": "thin_page_needs_rendering", "chars": n, "http_ms": http_ms}
         return {"opened": Opened(session, page, resp.status, resp.url, html, "http", (resp.headers or {}).get("last-modified")), "http_ms": http_ms}
@@ -567,7 +580,7 @@ class Reader:
             scrolled = await auto_scroll(page) if opts.get("auto_scroll") and op.via == "browser" else None
             out: Dict[str, Any] = {"url": page.url if op.via == "browser" else op.url, "status": op.status, "via": op.via}
             try:
-                out["title"] = await page.title()
+                out["title"] = textops.clip(await page.title(), 120)
             except Exception:
                 pass
             if o.get("problem"):
@@ -583,12 +596,19 @@ class Reader:
             if section:
                 asked = section if isinstance(section, list) else [section]
                 kws = list(dict.fromkeys(w for k in asked if k for w in next((g for g in sites.synonyms() if any(x.lower() == str(k).lower() for x in g)), [str(k)])))
-                out["sections"] = await js(page, "sections", {"kws": kws, "maxEach": 2500})
+                out["sections"] = await js(page, "sections", {"kws": kws, "maxEach": opts["max_chars"] if opts.get("max_chars_given") else 2500})
             else:
                 text, mres = "", None
                 fmt = opts.get("format", "text")
                 if opts.get("mode", "main") == "main" and not opts.get("selector") and not opts.get("include_hidden"):
                     mres = await js(page, "main")
+                    # Readability sometimes keeps one block of a long page (wiki intros, portal front pages):
+                    # when it holds under a fifth of the visible text, all visible text is read instead.
+                    if mres and mres.get("text"):
+                        body = await page.evaluate("() => (document.body && document.body.innerText || '').length")
+                        n = len(mres["text"])
+                        if (n < 500 and body > 2 * n) or (n < body * 0.2 and body - n > 2000):
+                            mres = None
                 if mres and len(mres.get("text") or "") > 200:
                     text = Convertor._convert_to_markdown(mres["html"]) if fmt == "markdown" else mres["text"]
                     out["extracted"] = "main"
@@ -606,7 +626,16 @@ class Reader:
                     out["hidden_chars_removed"] = t["hidden_chars"]
                     if opts.get("include_hidden"):
                         out["hidden_text"] = t.get("hidden_text", "")
-                if len(text) < 300 and op.via == "browser":
+                if len(text.strip()) < 50:
+                    # Nothing visible to read (players, apps drawn in canvas): the page's own description.
+                    m = (await js(page, "structured")).get("meta", {})
+                    desc = m.get("og:description") or m.get("description") or m.get("twitter:description")
+                    if desc:
+                        text = "\n".join(x for x in (m.get("og:title"), desc) if x)
+                        out["extracted"] = "meta_description"
+                    elif not o.get("problem"):
+                        out["problem"] = "no_text"
+                if len(text) < 300 and op.via == "browser" and out.get("extracted") != "meta_description":
                     frames = []
                     for f in page.frames[1:8]:
                         try:
@@ -623,6 +652,11 @@ class Reader:
                     text = textops.footnotes(text)
                 if opts.get("query"):
                     text, out["query_filter"] = textops.relevant(text, opts["query"], max_chars)
+                elif opts.get("outline_long") and len(text) > LONG_PAGE and not offset and not opts.get("max_chars_given") and not opts.get("selector"):
+                    outline = await js(page, "outline", {"max": 2500})
+                    if outline:
+                        out["outline"] = outline
+                        max_chars = LONG_HEAD
                 out.update(total_chars=len(text), offset=offset, text=text[offset : offset + max_chars])
                 if offset + max_chars < len(text):
                     out["next_offset"] = offset + max_chars
