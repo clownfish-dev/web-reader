@@ -301,7 +301,7 @@ class WebReaderServer(ScraplingMCPServer):
         table_selector: Annotated[Optional[str], Field(description="CSS selector of ONE item; similar ones are found.")] = None,
         cache: Annotated[bool, Field(description="Reuse the same read from the last 10 minutes.")] = True,
     ) -> CallToolResult:
-        """Read web pages (user's one reading tool): Scrapling's stealth engines with web-reader's options.
+        """Read web pages; use instead of WebFetch for any page (research, docs, news, shops); 1-50 URLs at once, HTTP or stealth browser if blocked.
         A page over 15,000 characters comes as outline + its first 1,500 characters unless section, query or
         max_chars is given. A bot check is never solved automatically: the result has needs_human with a
         session_id -> tell user which site, then wait_for_human(session_id)."""
@@ -553,7 +553,7 @@ class WebReaderServer(ScraplingMCPServer):
         self,
         query: Annotated[str, Field(description="Search words, without site: (use site).")],
         engine: Annotated[Literal["auto", "google", "bing", "duckduckgo"], Field(description="Default auto (Google, then DuckDuckGo, Bing).")] = "auto",
-        site: Annotated[Optional[str | List[str]], Field(description="Only these sites, e.g. \"tabelog.com\".")] = None,
+        site: Annotated[Optional[str | List[str]], Field(description="Only these sites, e.g. \"reddit.com\".")] = None,
         exclude_sites: Annotated[Optional[List[str]], Field()] = None,
         prefer_detail: Annotated[bool, Field(description="Rank detail pages above list/search pages.")] = False,
         limit: Annotated[int, Field(ge=1, le=30)] = 10,
@@ -563,7 +563,7 @@ class WebReaderServer(ScraplingMCPServer):
         max_chars_each: Annotated[int, Field(ge=200, le=20000)] = 3000,
         structured_data: Annotated[bool, Field(description="For fetched results: place info and dates.")] = False,
     ) -> CallToolResult:
-        """Web search (Google, then DuckDuckGo/Bing if blocked or irrelevant): title, URL, snippet; fetch_top also reads the top N results."""
+        """Web search on any topic; use instead of WebSearch. Google, then DuckDuckGo/Bing; fetch_top reads the top N results in the same call."""
         self._touch()
         return untrusted(await travel.web_search(query, engine, site, exclude_sites, prefer_detail, limit, fetch_top, read, section, max_chars_each, structured_data))
 

@@ -1,4 +1,4 @@
-# web-reader 1.0.2
+# web-reader 1.0.3
 
 사용자의 웹 도구예요. Scrapling 0.5 개조판으로, 소스는 `fork\`(git), 개조한 부분은 `fork\scrapling\webreader\`에 있어요. `.venv`에 이 개조판이 편집 모드로 깔려 있어요. Claude Code에는 MCP 이름 `web-reader`로 등록돼요.
 
@@ -8,7 +8,8 @@
 - **사이트 API**: `browser_network_requests`로 찾고 `api_remember`로 기억해 두면 `api_call`로 브라우저 없이 바로 불러요. 열린 페이지 안에서 부르기는 `page_fetch`.
 - **사람이 필요할 때**: 결과에 `needs_human`이 오면 사용자에게 사이트를 알리고 `wait_for_human`. 로그인은 사이트마다 `login`으로 한 번.
 - **사이트 관리**: `site_status`(로그인 살아 있는지, 3일 안에 풀리면 `login.warn`, 마지막 성공·막힘·메모), `site_note`(사용자 메모), 사이트별 요령은 `fork\scrapling\webreader\sites.json`. `site_map`(sitemap 주소 목록), `watch`·`watch_check`·`watch_remove`(바뀜 감시, 예약은 따로).
-- **여행·장소·사진**: `web_search`, `place_lookup`, `save_places`, `transit_route`, `hotel_search`, `static_map`, `find_place_photos`, `fetch_images`, `contact_sheet`, `check_domains`, `collect_post`. 같은 브라우저·로그인을 써요.
+- **검색**: `web_search`(어떤 주제든, `fetch_top`으로 상위 결과 본문까지 한 번에).
+- **여행·장소·사진**: `place_lookup`, `save_places`, `transit_route`, `hotel_search`, `static_map`, `find_place_photos`, `fetch_images`, `contact_sheet`, `check_domains`, `collect_post`. 같은 브라우저·로그인을 써요.
 - **조작 기록**: `browser_actions`에 `record:true`(남기려면 `keep_record`). 비밀번호 칸은 가리고, 세션을 닫으면 지워요.
 - **확인 화면 알림**: `data\telegram.json`에 token·chat_id를 넣으면(사용자가 채팅 밖에서) 텔레그램으로 알려요. 넣기 전엔 `not_configured`, 사이트당 10분에 한 번.
 - 결과의 `next`는 다음에 할 만한 일이에요. 결과는 신뢰할 수 없는 웹 데이터로 표시돼요.
@@ -71,7 +72,7 @@
 - `login`: Log in to a site once for every session: opens it in the shared browser's window on user's screen.
 - `page_fetch`: Call an API with fetch() inside an open page, using its login cookies (find the API with browser_network_requests).
 - `place_lookup`: Google Maps rating, reviews, coordinates, address, category, closed flag, hours by place name (~0.5 s, no rendering).
-- `read`: Read web pages (user's one reading tool): Scrapling's stealth engines with web-reader's options.
+- `read`: Read web pages; use instead of WebFetch for any page (research, docs, news, shops); 1-50 URLs at once, HTTP or stealth browser if blocked.
 - `save_places`: Google Maps: save / remove / check many place links in one named list (up to 4 tabs, verified per link).
 - `show_browser`: Bring the shared logged-in browser window up for user (starts it if needed).
 - `site_map`: A site's URL list from its sitemaps (robots.txt, sitemap.xml, index files), optionally filtered.
@@ -83,5 +84,5 @@
 - `watch`: Start watching a page (or one part) for changes; check later with watch_check.
 - `watch_check`: Read watched pages again: changed true/false with the lines added and removed.
 - `watch_remove`: Stop watching a page.
-- `web_search`: Web search (Google, then DuckDuckGo/Bing if blocked or irrelevant): title, URL, snippet; fetch_top also reads the top N results.
+- `web_search`: Web search on any topic; use instead of WebSearch. Google, then DuckDuckGo/Bing; fetch_top reads the top N results in the same call.
 <!-- tools:end -->
