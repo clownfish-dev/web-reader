@@ -45,14 +45,16 @@ def _session_options() -> dict:
 
 def _cat_icon() -> None:
     """web-reader's cat on user's window (taskbar + title bar, its own taskbar group): tools/window-icon.ps1
-    keeps it applied while the browser runs. Started through WMI so it outlives this server."""
+    keeps it applied while the browser runs. Started through WMI so it outlives this server; ShowWindow=0 so its
+    console never flashes up."""
     if os.name != "nt":
         return
     script = Path(__file__).resolve().parent / "tools" / "window-icon.ps1"
     cmd = f'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{script}" -Dir "{PROFILE}" -Watch'
     try:
         subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-                          "Invoke-CimMethod Win32_Process -MethodName Create -Arguments @{ CommandLine = $env:WR_CMD } | Out-Null"],
+                          "$si = New-CimInstance -ClassName Win32_ProcessStartup -Namespace root/cimv2 -ClientOnly -Property @{ ShowWindow = [uint16]0 }; "
+                          "Invoke-CimMethod Win32_Process -MethodName Create -Arguments @{ CommandLine = $env:WR_CMD; ProcessStartupInformation = $si } | Out-Null"],
                          env={**os.environ, "WR_CMD": cmd}, creationflags=0x08000000, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
