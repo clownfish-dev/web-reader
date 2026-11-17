@@ -12,6 +12,7 @@ WEB_READER_HEADLESS=1 runs it without a window (a PC with no desktop, like Windo
 """
 
 import asyncio
+import json
 import os
 import subprocess
 import time
@@ -32,6 +33,7 @@ PARKED = {"left": -32000, "top": -32000}
 SHOWN = {"left": 80, "top": 60, "width": 1280, "height": 900}
 # A window a person uses must follow its own size (no fixed 1920x1080 emulation at 2x zoom)
 # and the system's light/dark setting.
+GRANTED_PERMISSIONS: tuple = ()  # no automatic grants; never "notifications" (a granted site can push desktop alerts). geolocation off, Maps tools measured unchanged
 _HUMAN_WINDOW = {"no_viewport": True, "viewport": None, "screen": None, "device_scale_factor": None, "color_scheme": "no-override"}
 
 
@@ -59,6 +61,30 @@ def _cat_icon() -> None:
     except OSError:
         pass
 
+def _block_notifications() -> None:
+    """Before the browser starts: the profile's default for notifications is "block" (Chrome's own "Don't allow sites
+    to send notifications"), and no site keeps an allow, so no site Claude or user visits can subscribe to push and
+    pop desktop alerts (2026-11-17: chosun.com did). A per-session CDP deny did not reach other origins (measured)."""
+    prefs = PROFILE / "Default" / "Preferences"
+    try:
+        data = json.loads(prefs.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    profile = data.setdefault("profile", {})
+    defaults = profile.setdefault("default_content_setting_values", {})
+    sites = profile.setdefault("content_settings", {}).setdefault("exceptions", {}).get("notifications") or {}
+    allowed = [k for k, v in sites.items() if isinstance(v, dict) and v.get("setting") == 1]
+    if defaults.get("notifications") == 2 and not allowed:
+        return
+    defaults["notifications"] = 2
+    for k in allowed:
+        sites[k]["setting"] = 2
+    prefs.parent.mkdir(parents=True, exist_ok=True)
+    tmp = prefs.with_suffix(".wr-tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    os.replace(tmp, prefs)
+
+
 class SharedBrowser:
     """Starts the profile's browser on first use and restarts it if it went away (user closed it)."""
 
@@ -79,8 +105,10 @@ class SharedBrowser:
             if self.alive:
                 return self._owner  # type: ignore[return-value]
             PROFILE.mkdir(parents=True, exist_ok=True)
+            _block_notifications()
             flags = [] if HEADLESS or SHARED_WINDOW else ["--window-position=-32000,-32000"]
-            extra = {"additional_args": dict(_HUMAN_WINDOW)} if not HEADLESS else {}
+            # The permission list is set here, not left to Scrapling's default (which grants "notifications" to every site).
+            extra = {"additional_args": {**({} if HEADLESS else _HUMAN_WINDOW), "permissions": list(GRANTED_PERMISSIONS)}}
             owner = AsyncStealthySession(user_data_dir=str(PROFILE), max_pages=1, extra_flags=flags, **extra, **_session_options())
             await owner.start()
             ctx = owner.context

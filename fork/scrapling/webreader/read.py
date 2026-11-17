@@ -86,15 +86,26 @@ def _load_http_blocked() -> Dict[str, Any]:
 
 
 def _remember_http_block(key: str, reason: str) -> None:
+    """Counts blocks within the day; HTTP is skipped only from the second one, so one passing 403
+    (reddit in a batch, 2026-11-15) does not cost the site's fast path for a whole day."""
     d = _load_http_blocked()
-    d[key] = {"reason": reason, "at": int(time.time())}
+    v = d.get(key) or {}
+    fresh = time.time() - v.get("at", 0) < HTTP_BLOCK_DAY
+    d[key] = {"reason": reason, "at": int(time.time()), "count": (v.get("count", 2) + 1 if fresh else 1)}
     HTTP_BLOCKED_FILE.parent.mkdir(parents=True, exist_ok=True)
     HTTP_BLOCKED_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def _forget_http_block(key: str) -> None:
+    d = _load_http_blocked()
+    if d.pop(key, None) is not None:
+        HTTP_BLOCKED_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def _http_blocked(key: str) -> Optional[str]:
     v = _load_http_blocked().get(key)
-    if v and time.time() - v.get("at", 0) < HTTP_BLOCK_DAY:
+    # Entries written before counting (no count) behave as before: skipped.
+    if v and time.time() - v.get("at", 0) < HTTP_BLOCK_DAY and v.get("count", 2) >= 2:
         return v.get("reason")
     return None
 
@@ -283,14 +294,15 @@ async def auto_scroll(page: Any, max_steps: int = 25, max_ms: int = 15000, pause
     return out
 
 
-async def _settle(page: Any, max_ms: int = 8000) -> None:
+async def _settle(page: Any, max_ms: int = 8000, shell_wait: bool = True) -> None:
     """After load: return once the network is quiet or the text stays about the same for 1 s (max 8 s).
     "About": within 2% (50 chars at least), so rotating banners and live counters do not hold the read."""
     t0 = time.monotonic()
     idle = asyncio.ensure_future(page.wait_for_load_state("networkidle", timeout=max_ms))
     last, same = -1, 0
+    short = 1500 if shell_wait else 0  # error pages (404 etc.) need no wait for data
     try:
-        while (time.monotonic() - t0) * 1000 < max_ms and not idle.done():
+        while (time.monotonic() - t0) * 1000 < max_ms and (not idle.done() or 0 < last < short):
             await asyncio.sleep(0.25)
             try:
                 n = await page.evaluate("() => (document.body && document.body.innerText || '').length")
@@ -298,7 +310,9 @@ async def _settle(page: Any, max_ms: int = 8000) -> None:
                 break
             same = same + 1 if last >= 0 and abs(n - last) <= max(50, last * 0.02) else 0
             last = n
-            if same >= 4 and n > 0:
+            # A short page is often a shell whose data is on its way even after the network went quiet
+            # (stock.naver.com: menus at 1.3 s, prices ~1 s later): it must stay still for 2 s, not 1 s.
+            if same >= (4 if n >= short else 8) and n > 0:
                 break
     finally:
         if not idle.done():
@@ -331,6 +345,8 @@ def next_steps(r: Dict[str, Any], url: str) -> List[str]:
     out: List[str] = []
     if r.get("needs_human"):
         out.append("사용자에게 사이트를 알리고 wait_for_human(session_id)")
+    elif r.get("problem") in ("http_404", "http_410"):
+        out.append("없는 페이지(404): 주소를 확인하거나 web_search로 새 주소 찾기")
     elif r.get("problem"):
         out.append("막혔으면 engine=browser, 그래도 막히면 login(url) 또는 사용자 손")
     if r.get("outline"):
@@ -404,11 +420,11 @@ class Reader:
         ua = await SHARED.user_agent()
         return {c["name"]: c["value"] for c in cookies}, ua
 
-    async def http_open(self, url: str, headers: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    async def http_open(self, url: str, headers: Optional[Dict[str, str]], force: bool = False) -> Dict[str, Any]:
         """One HTTP request with Chrome's TLS, the browser's cookies and user agent. Returns
-        {opened} or {skipped: reason}."""
+        {opened} or {skipped: reason}. force: try even if the site is remembered as blocked."""
         key = _block_key(url)
-        remembered = _http_blocked(key)
+        remembered = None if force else _http_blocked(key)
         if remembered:
             return {"skipped": remembered, "remembered": True, "block_key": key}
         cookies, ua = await self._cookie_header_parts(url)
@@ -446,6 +462,7 @@ class Reader:
         if n < 1500 and re.search(r"<script\b[^>]*\bsrc=|<script\b[^>]*>\s*\S{200}", html, re.I):
             await session.close()
             return {"skipped": "thin_page_needs_rendering", "chars": n, "http_ms": http_ms}
+        _forget_http_block(key)
         return {"opened": Opened(session, page, resp.status, resp.url, html, "http", (resp.headers or {}).get("last-modified")), "http_ms": http_ms}
 
     async def _static_tab(self) -> "_StaticTab":
@@ -479,7 +496,7 @@ class Reader:
                 # Read from DOMContentLoaded + settle instead of waiting for "load" (every script,
                 # stylesheet and ad): 1.9-3.0 s of 3.0-3.6 s per tabelog page went to that wait.
                 resp = await page.goto(url, wait_until="domcontentloaded")
-                await _settle(page)
+                await _settle(page, shell_wait=not (resp and resp.status >= 400))
                 if wait_ms:
                     await page.wait_for_timeout(wait_ms)
         except Exception:
@@ -546,6 +563,16 @@ class Reader:
                 if ed:
                     _prefer_edition[site] = ed
             return {"opened": o, "problem": problem, "tried": failures or None, "opened_instead": u if u != url and not problem else None, "blocked_original": blocked_seen, "http": http_info}
+        if last and use_http and http_info and http_info.get("remembered"):
+            # HTTP was skipped from memory and the browser is blocked too: HTTP once more before asking user.
+            h = await self.http_open(url, opts.get("headers"), force=True)
+            if "document" in h:
+                await last[0].session.close()
+                return {"document": h["document"]}
+            if "opened" in h:
+                await last[0].session.close()
+                return {"opened": h["opened"], "problem": None, "tried": failures or None, "opened_instead": None, "blocked_original": False, "http": None}
+            failures.append({"url": url, "via": "http", "problem": h.get("skipped"), "retried": True})
         if last:  # every try blocked: keep the last tab for user
             return {"opened": last[0], "problem": last[1], "tried": failures, "needs_human": True, "http": http_info}
         raise RuntimeError("모든 주소 실패: " + " | ".join(f"{f['url']} → {f.get('problem') or f.get('error')}" for f in failures))
@@ -585,6 +612,9 @@ class Reader:
                 pass
             if o.get("problem"):
                 out["problem"] = o["problem"]
+            elif op.status in (404, 410):
+                # The site's "not found" page still comes back, marked so it is not taken for the page asked.
+                out["problem"] = f"http_{op.status}"
             if o.get("opened_instead") and o.get("blocked_original"):
                 out["opened_instead"] = o["opened_instead"]
                 out["note"] = "원래 주소가 403/확인 화면으로 막혀 같은 페이지의 다른 언어판을 읽었어요."
@@ -607,7 +637,8 @@ class Reader:
                     if mres and mres.get("text"):
                         body = await page.evaluate("() => (document.body && document.body.innerText || '').length")
                         n = len(mres["text"])
-                        if (n < 500 and body > 2 * n) or (n < body * 0.2 and body - n > 2000):
+                        # An article page (og:type / JSON-LD Article) keeps its story when Readability found one.
+                        if not (mres.get("article") and n >= 300) and ((n < 500 and body > 2 * n) or (n < body * 0.2 and body - n > 2000)):
                             mres = None
                 if mres and len(mres.get("text") or "") > 200:
                     text = Convertor._convert_to_markdown(mres["html"]) if fmt == "markdown" else mres["text"]
@@ -624,6 +655,8 @@ class Reader:
                         text = "".join(Convertor._extract_content(sel, extraction_type="markdown", css_selector=opts.get("selector"), main_content_only=True)).strip() or text
                     out["extracted"] = "selector" if opts.get("selector") else "all_visible"
                     out["hidden_chars_removed"] = t["hidden_chars"]
+                    if t.get("menu_chars_removed"):
+                        out["menu_chars_removed"] = t["menu_chars_removed"]
                     if opts.get("include_hidden"):
                         out["hidden_text"] = t.get("hidden_text", "")
                 if len(text.strip()) < 50:

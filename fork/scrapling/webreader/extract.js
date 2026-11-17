@@ -43,9 +43,26 @@ const wr = {
     holder.style.cssText = 'position:absolute;left:-99999px;top:0;width:1200px';
     holder.appendChild(clone);
     document.body.appendChild(holder);
-    const t = holder.innerText;
+    const clean = (s) => s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    let t = clean(holder.innerText);
+    // Whole-page reads: site menus, banners and footers (outside the article/main area) go, unless
+    // that would leave too little (some sites put the content itself inside a header or nav).
+    let chrome = 0;
+    if (!sel) {
+      const menus = [...clone.querySelectorAll('nav,[role=navigation],[role=banner],[role=contentinfo],header,footer')]
+        .filter((n) => !n.closest('article,main,[role=main]') || /^(NAV)$/i.test(n.tagName) && !n.closest('article'));
+      const top = menus.filter((n) => !menus.some((m) => m !== n && m.contains(n)));
+      if (top.length) {
+        const keep = top.map((n) => [n, n.parentNode, n.nextSibling]);
+        top.forEach((n) => n.remove());
+        const t2 = clean(holder.innerText);
+        if (t2.length >= 200 && t2.length >= t.length * 0.3) { chrome = t.length - t2.length; t = t2; }
+        else keep.reverse().forEach(([n, p, s]) => p.insertBefore(n, s));
+      }
+    }
     holder.remove();
-    const out = { text: t.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim(), hidden_chars: hiddenText.length };
+    const out = { text: t, hidden_chars: hiddenText.length };
+    if (chrome > 0) out.menu_chars_removed = chrome;
     if (includeHidden) out.hidden_text = hiddenText.slice(0, 20000);
     return out;
   },
@@ -64,7 +81,10 @@ const wr = {
       document.body.appendChild(holder);
       const text = holder.innerText.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
       holder.remove();
-      return { title: a.title, byline: a.byline || undefined, published: a.publishedTime || undefined, site: a.siteName || undefined, text, html: a.content };
+      // A news/blog article page: its short story is the whole point, even inside a big portal page.
+      const ogType = (document.querySelector('meta[property="og:type"]')?.content || '').toLowerCase();
+      const article = ogType === 'article' || /"@type"\s*:\s*"(NewsArticle|Article|BlogPosting|ReportageNewsArticle)"/.test([...document.querySelectorAll('script[type="application/ld+json"]')].map((s) => s.textContent).join(' '));
+      return { title: a.title, byline: a.byline || undefined, published: a.publishedTime || undefined, site: a.siteName || undefined, text, html: a.content, article };
     } catch (e) { return null; }
   },
 

@@ -7,6 +7,8 @@
   plugin/language/permission inconsistencies), the same kinds of checks as web-reader --botcheck.
   The page is served from this PC (no outside site), so the request header can be compared with the
   page's and a worker's user agent; a mismatch is what sites look for (measured 2026-10-21).
+- notifications: profile blocks them by default, allows no site, holds no push subscription, and a page
+  sees notification and push permissions as denied (2026-11-17 chosun.com desktop alerts).
 - code: no call that plants something lasting in pages (init scripts, exposed functions); they
   leave globals bot checks look for. Run after development, before deploying.
 WARN lines are reported but do not fail the run.
@@ -20,7 +22,7 @@ import sys
 import threading
 from pathlib import Path
 
-from scrapling.webreader.browser import ROOT
+from scrapling.webreader.browser import PROFILE, ROOT
 from scrapling.webreader.proxy import HeldSession
 from scrapling.webreader.shim import _connect
 
@@ -47,6 +49,8 @@ PROBE = """async () => {
     chrome: typeof window.chrome,
     automation_globals: keys,
     notification: typeof Notification === 'undefined' ? 'none' : Notification.permission,
+    notification_query: await navigator.permissions.query({name: 'notifications'}).then((s) => s.state, (e) => 'error: ' + e.message),
+    push_query: await navigator.permissions.query({name: 'push', userVisibleOnly: true}).then((s) => s.state, (e) => 'error: ' + e.message),
     outer: [outerWidth, outerHeight],
     inner: [innerWidth, innerHeight],
   };
@@ -107,6 +111,28 @@ def code_check() -> list:
     return problems
 
 
+def notification_check() -> list:
+    """No site can send desktop alerts: the profile blocks notifications by default, allows none, and holds no
+    push subscription (Chrome writes Preferences a few seconds after a change)."""
+    problems = []
+    try:
+        data = json.loads((PROFILE / "Default" / "Preferences").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return [f"notifications: profile Preferences unreadable: {e}"]
+    prof = data.get("profile", {})
+    if prof.get("default_content_setting_values", {}).get("notifications") != 2:
+        problems.append("notifications: profile default is not block")
+    sites = prof.get("content_settings", {}).get("exceptions", {}).get("notifications") or {}
+    allowed = [k for k, v in sites.items() if isinstance(v, dict) and v.get("setting") == 1]
+    if allowed:
+        problems.append(f"notifications: allowed sites {allowed}")
+    subs = sorted((data.get("gcm", {}).get("push_messaging_application_id_map") or {}).values())
+    if subs:
+        problems.append(f"notifications: push subscriptions {subs}")
+    print(f"notifications: {'ok' if not problems else 'NOT BLOCKED'}")
+    return problems
+
+
 async def bot_check(remote: HeldSession) -> tuple:
     """Returns (problems, warns)."""
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _EchoUA)
@@ -143,7 +169,10 @@ async def bot_check(remote: HeldSession) -> tuple:
         problems.append("no languages")
     if p["chrome"] != "object":
         problems.append("window.chrome missing")
-    print("bot traces:", json.dumps({k: p[k] for k in ("webdriver", "ua", "worker_ua", "header_ua", "brands", "plugins", "languages", "chrome", "automation_globals", "outer", "inner")}, ensure_ascii=False))
+    # No site may send desktop alerts through the shared browser (2026-11-17 chosun.com push alerts).
+    if p["notification"] != "denied" or p["notification_query"] != "denied" or p["push_query"] != "denied":
+        problems.append(f"notifications not denied: Notification={p['notification']} query={p['notification_query']} push={p['push_query']}")
+    print("bot traces:", json.dumps({k: p[k] for k in ("webdriver", "ua", "worker_ua", "header_ua", "brands", "plugins", "languages", "chrome", "automation_globals", "notification", "notification_query", "push_query", "outer", "inner")}, ensure_ascii=False))
     return problems, warns
 
 
@@ -152,7 +181,7 @@ async def main() -> int:
     try:
         problems = code_check() + await tools_check(remote, "--write" in sys.argv)
         bot_problems, warns = await bot_check(remote)
-        problems += bot_problems
+        problems += bot_problems + notification_check()  # after the browser has started (it writes the profile block)
     finally:
         await remote.close()
     for w in warns:

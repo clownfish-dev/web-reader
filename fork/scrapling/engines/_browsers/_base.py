@@ -595,7 +595,8 @@ class StealthySessionMixin(BaseSessionMixin):
                 "ignore_https_errors": True,
                 "screen": {"width": 1920, "height": 1080},
                 "viewport": {"width": 1920, "height": 1080},
-                "permissions": ["geolocation", "notifications"],
+                # web-reader: no "notifications" grant; on the shared persistent profile it let every visited site push desktop alerts
+                "permissions": ["geolocation"],
             }
         )
         self.__generate_stealth_options()
